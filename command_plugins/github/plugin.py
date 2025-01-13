@@ -49,6 +49,13 @@ class GitHubPlugin(BotCommander):
                 "permitted_permissions": ["push", "pull"],  # To grant admin, add this to the config for
                 "enabled": True  # this command in the config.py.
             },
+            "!RemoveCollab": {
+                "command": "!RemoveCollab",
+                "func": self.remove_outside_collab_command,
+                "user_data_required": True,
+                "help": "Removes an outside collaborator from a specific repository in a specific GitHub organization.",
+                "enabled": True  # this command in the config.py.
+            },
             "!SetRepoPermissions": {
                 "command": "!SetRepoPermissions",
                 "func": self.set_repo_permissions_command,
@@ -333,6 +340,62 @@ class GitHubPlugin(BotCommander):
                      markdown=True, thread=data["ts"])
 
     @hubcommander_command(
+        name="!RemoveCollab",
+        usage="!RemoveCollab <OutsideCollabId> <OrgWithRepo> <Repos(Comma separated if more than 1)>",
+        description="This will remove an outside collaborator from a repository.",
+        required=[
+            dict(name="collab", properties=dict(type=str, help="The outside collaborator's GitHub ID.")),
+            dict(name="org", properties=dict(type=str, help="The organization that contains the repo."),
+                 validation_func=lookup_real_org, validation_func_kwargs={}),
+            dict(name="repos", properties=dict(type=str, help="A comma separated list (or not if just 1) of repos to "
+                                                              "add the collaborator to."),
+                 validation_func=extract_multiple_repo_names, validation_func_kwargs={}),
+        ],
+        optional=[]
+    )
+    @auth()
+    @repo_must_exist()
+    @github_user_exists("collab")
+    def remove_outside_collab_command(self, data, user_data, collab, org, repos):
+        """
+        Removes an outside collaborator to repository (or multiple repos).
+
+        Command is as follows: !removecollab <outside_collab_id> <organization> <repo>
+        :param repo:
+        :param org:
+        :param collab:
+        :param user_data:
+        :param data:
+        :return:
+        """
+        # Output that we are doing work:
+        send_info(data["channel"], "@{}: Working, Please wait...".format(user_data["name"]), thread=data["ts"])
+
+        # Grant access:
+        try:
+            for r in repos:
+                self.remove_outside_collab_from_repo(collab, r, org)
+
+        except ValueError as ve:
+            send_error(data["channel"],
+                       "@{}: Problem encountered removing the user as an outside collaborator.\n"
+                       "The response code from GitHub was: {}".format(user_data["name"], str(ve)), thread=data["ts"])
+            return
+
+        except Exception as e:
+            send_error(data["channel"],
+                       "@{}: Problem encountered removing the user as an outside collaborator.\n"
+                       "Here are the details: {}".format(user_data["name"], str(e)), thread=data["ts"])
+            return
+
+        # Done:
+        send_success(data["channel"],
+                     "@{}: The GitHub user: `{}` has been removed as an outside collaborator "
+                     "from {} in {}.".format(user_data["name"], collab,
+                                             ", ".join(repos), org),
+                     markdown=True, thread=data["ts"])
+
+    @hubcommander_command(
         name="!SetRepoPermissions",
         usage="!SetRepoPermissions <OrgWithRepo> <Repo> <Team> <Permission>",
         description="This will set team permissions on a repository .",
@@ -351,7 +414,7 @@ class GitHubPlugin(BotCommander):
     @auth()
     @repo_must_exist()
     @team_must_exist()
-    def set_repo_permissions_command(self, data, user_data, team, org, repo, permission, team_id=None):
+    def set_repo_permissions_command(self, data, user_data, team, org, repo, permission):
         """
         Adds a team to a repository with a specified permission.
 
@@ -369,7 +432,7 @@ class GitHubPlugin(BotCommander):
 
         # Grant access:
         try:
-            self.set_repo_permissions(repo, org, team_id, permission)
+            self.set_repo_permissions(repo, org, team, permission)
 
         except ValueError as ve:
             send_error(data["channel"],
@@ -408,7 +471,7 @@ class GitHubPlugin(BotCommander):
     @auth()
     @github_user_exists("user_id")
     @team_must_exist()
-    def add_user_to_team_command(self, data, user_data, user_id, org, team, role, team_id=None):
+    def add_user_to_team_command(self, data, user_data, user_id, org, team, role):
         """
         Adds a GitHub user to a team with a specified role.
 
@@ -426,7 +489,7 @@ class GitHubPlugin(BotCommander):
 
         # Do it:
         try:
-            self.invite_user_to_gh_org_team(user_id, team_id, role)
+            self.invite_user_to_gh_org_team(org, team, user_id, role)
 
         except ValueError as ve:
             send_error(data["channel"],
@@ -509,7 +572,7 @@ class GitHubPlugin(BotCommander):
         # Grant the proper teams access to the repository:
         try:
             for perm_dict in ORGS[org]["new_repo_teams"]:
-                self.set_repo_permissions(repo, org, perm_dict["id"], perm_dict["perm"])
+                self.set_repo_permissions(repo, org, perm_dict["name"], perm_dict["perm"])
 
         except Exception as e:
             send_error(data["channel"],
@@ -1230,6 +1293,17 @@ class GitHubPlugin(BotCommander):
         return True
 
     def add_outside_collab_to_repo(self, outside_collab_id, repo_name, real_org, permission):
+        # Make sure the user is not a member of any of the "validation" teams
+        # in an org; this prevents us from accidentally adding collaborators who
+        # are already given the permissions they need via a different mechanism.
+        if "collab_validation_teams" in ORGS[real_org]:
+            for team in ORGS[real_org]["collab_validation_teams"]:
+                if self.check_if_user_is_member_of_team(real_org, outside_collab_id, team):
+                    raise Exception(("User {} is already a member of the {} "
+                        "team in {}. You should not add them as an external "
+                        "collaborator as well. Consider using the !InviteMeTo command "
+                        "instead.").format(outside_collab_id, team, real_org))
+
         headers = {
             'Authorization': 'token {}'.format(self.token),
             'Accept': GITHUB_VERSION
@@ -1240,6 +1314,22 @@ class GitHubPlugin(BotCommander):
         # Add the outside collab to the repo:
         api_part = 'repos/{}/{}/collaborators/{}'.format(real_org, repo_name, outside_collab_id)
         response = requests.put('{}{}'.format(GITHUB_URL, api_part), data=json.dumps(data), headers=headers, timeout=10)
+
+        # GitHub response code flakiness...
+        if response.status_code not in [201, 204]:
+            raise ValueError(response.status_code)
+
+    def remove_outside_collab_from_repo(self, outside_collab_id, repo_name, real_org):
+        headers = {
+            'Authorization': 'token {}'.format(self.token),
+            'Accept': GITHUB_VERSION
+        }
+
+        # Add the outside collab to the repo:
+        api_part = 'repos/{}/{}/collaborators/{}'.format(real_org, repo_name, outside_collab_id)
+        response = requests.delete('{}{}'.format(GITHUB_URL, api_part),
+                                   headers=headers,
+                                   timeout=10)
 
         # GitHub response code flakiness...
         if response.status_code not in [201, 204]:
@@ -1294,7 +1384,7 @@ class GitHubPlugin(BotCommander):
             'Authorization': 'token {}'.format(self.token),
             'Accept': GITHUB_VERSION
         }
-        api_part = 'teams/{}/repos/{}/{}'.format(team, org, repo_to_set)
+        api_part = 'orgs/{}/teams/{}/repos/{}/{}'.format(org, team, org, repo_to_set)
 
         data = {
             "permission": permission
@@ -1386,7 +1476,37 @@ class GitHubPlugin(BotCommander):
 
         return False
 
-    def invite_user_to_gh_org_team(self, github_id, team_id, role):
+    def check_if_user_is_member_of_team(self, org, github_id, team_name):
+        """
+        This will connect to GitHub, and try to retrieve the membership status of a
+        single user for a team in a given org.
+        """
+
+        # Check if the user exists first:
+        user = self.get_github_user(github_id)
+
+        if not user:
+            return None
+
+
+        headers = {
+            'Authorization': 'token {}'.format(self.token),
+            'Accept': GITHUB_VERSION
+        }
+
+        # Retrieve a users membership details.
+        api_part = 'orgs/{}/teams/{}/memberships/{}'.format(org, team_name, github_id)
+        response = requests.get('{}{}'.format(GITHUB_URL, api_part), headers=headers, timeout=10)
+
+        if response.status_code == 200:
+            return True
+
+        elif response.status_code != 404:
+            raise ValueError("GitHub Problem: Checking membership, status code: {}".format(response.status_code))
+
+        return False
+
+    def invite_user_to_gh_org_team(self, org, team, username, role):
         headers = {
             'Authorization': 'token {}'.format(self.token),
             'Accept': GITHUB_VERSION
@@ -1395,7 +1515,7 @@ class GitHubPlugin(BotCommander):
         data = {"role": role}
 
         # Add the GitHub user to the team:
-        api_part = 'teams/{}/memberships/{}'.format(team_id, github_id)
+        api_part = 'orgs/{}/teams/{}/memberships/{}'.format(org, team, username)
         response = requests.put('{}{}'.format(GITHUB_URL, api_part), data=json.dumps(data), headers=headers, timeout=10)
 
         if response.status_code != 200:
